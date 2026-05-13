@@ -1,0 +1,56 @@
+[package]
+name = "taquba-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/micllam/taquba-mcp"
+homepage = "https://github.com/micllam/taquba-mcp"
+description = "Durable backend for rmcp's task subsystem, built on the Taquba task queue."
+readme = "README.md"
+keywords = ["mcp", "rmcp", "taquba", "tasks", "modelcontextprotocol"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+rmcp = { version = "1.7", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+    "schemars",
+] }
+taquba = { version = "0.4", default-features = false }
+
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "io-util"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "1"
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+bytes = "1"
+futures = "0.3"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+
+[features]
+# No object-store backend is enabled by default. Pick exactly one for
+# production deployments; defaults work for in-memory and local-disk stores.
+default = []
+aws = ["taquba/aws"]
+gcp = ["taquba/gcp"]
+azure = ["taquba/azure"]
+
+# Opt-in OAuth 2.1 support, forwarded to rmcp.
+auth = ["rmcp/auth"]
+
+[dev-dependencies]
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Integration tests run the worker pool on a multi-thread runtime.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# The `echo_and_slow_client` example drives the server example over stdio.
+rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
