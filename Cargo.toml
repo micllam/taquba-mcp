@@ -22,7 +22,7 @@ rmcp = { version = "1.7", default-features = false, features = [
     "transport-streamable-http-server",
     "schemars",
 ] }
-taquba = { version = "0.4", default-features = false }
+taquba = { version = "0.8", default-features = false }
 
 tokio = { version = "1", features = ["macros", "rt", "sync", "time", "io-util"] }
 tokio-util = "0.7"
