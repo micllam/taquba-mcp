@@ -19,12 +19,12 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use taquba::object_store::ObjectStore;
 use taquba::object_store::path::Path;
-use taquba::{CancelOutcome, EnqueueOptions, JobStatus, OpenOptions, Queue};
+use taquba::{CancelOutcome, Clock, EnqueueOptions, JobStatus, OpenOptions, Queue, SystemClock};
 use tokio::sync::RwLock;
 
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::error::{Error, Result};
-use crate::result_store::{FinishedStatus, ResultRecord, ResultStore, expires_at_ms, now_ms};
+use crate::result_store::{FinishedStatus, ResultRecord, ResultStore, expires_at_ms};
 use crate::worker::{InFlight, InFlightInfo, RetryPolicy};
 
 /// Configuration settings for a [`TaqubaTaskBackend`].
@@ -91,6 +91,7 @@ pub struct TaqubaTaskBackend {
     audit_log: AuditLog,
     in_flight: RwLock<InFlight>,
     config: TaqubaTaskBackendConfig,
+    clock: Arc<dyn Clock>,
 }
 
 impl TaqubaTaskBackend {
@@ -115,12 +116,20 @@ impl TaqubaTaskBackend {
         self.audit_log.clone()
     }
 
+    /// Current time in ms since the UNIX epoch, read through the backend's
+    /// configured [`Clock`]. Used everywhere a state-transition timestamp is
+    /// recorded so tests can substitute a [`taquba::MockClock`].
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     pub(crate) async fn mark_in_flight(&self, task_id: &str, tool: &str) {
+        let started_at_ms = self.now_ms();
         self.in_flight.write().await.insert(
             task_id.to_string(),
             InFlightInfo {
                 tool: tool.to_string(),
-                started_at_ms: now_ms(),
+                started_at_ms,
             },
         );
     }
@@ -156,11 +165,12 @@ impl TaqubaTaskBackend {
 
         // Track it as in-flight so `list_tasks` / `get_task_info` see it
         // before a worker has claimed.
+        let now = self.now_ms();
         self.in_flight.write().await.insert(
             task_id.clone(),
             InFlightInfo {
                 tool: tool.clone(),
-                started_at_ms: now_ms(),
+                started_at_ms: now,
             },
         );
 
@@ -170,7 +180,7 @@ impl TaqubaTaskBackend {
                 event: AuditEvent::Submitted,
                 task_id: task_id.clone(),
                 tool: tool.clone(),
-                at_ms: now_ms(),
+                at_ms: now,
                 error: None,
             })
             .await;
@@ -394,7 +404,7 @@ impl TaqubaTaskBackend {
                                 event: AuditEvent::Cancelled,
                                 task_id: task_id.clone(),
                                 tool,
-                                at_ms: now_ms(),
+                                at_ms: self.now_ms(),
                                 error: None,
                             })
                             .await;
@@ -419,14 +429,15 @@ impl TaqubaTaskBackend {
     /// Write a terminal `Cancelled` result blob and audit entry. Used by
     /// `cancel_task` for tasks cancelled while still Pending/Scheduled.
     async fn record_cancelled(&self, task_id: &str, tool: &str) {
+        let now = self.now_ms();
         let record = ResultRecord {
             task_id: task_id.to_string(),
             tool: tool.to_string(),
             status: FinishedStatus::Cancelled,
             result: None,
             error: None,
-            completed_at_ms: now_ms(),
-            expires_at_ms: expires_at_ms(now_ms(), self.config.result_retention),
+            completed_at_ms: now,
+            expires_at_ms: expires_at_ms(now, self.config.result_retention),
         };
         if let Err(e) = self.result_store.put(&record).await {
             tracing::warn!(task_id = %task_id, error = %e, "cancel result write failed");
@@ -437,7 +448,7 @@ impl TaqubaTaskBackend {
                 event: AuditEvent::Cancelled,
                 task_id: task_id.to_string(),
                 tool: tool.to_string(),
-                at_ms: now_ms(),
+                at_ms: now,
                 error: None,
             })
             .await;
@@ -592,6 +603,7 @@ pub struct TaqubaTaskBackendBuilder {
     object_store: Option<Arc<dyn ObjectStore>>,
     prefix: Option<String>,
     config: TaqubaTaskBackendConfig,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl TaqubaTaskBackendBuilder {
@@ -652,6 +664,19 @@ impl TaqubaTaskBackendBuilder {
         self
     }
 
+    /// Override the time source. The same [`Clock`] is threaded into
+    /// Taquba's [`OpenOptions::clock`](taquba::OpenOptions::clock) so the
+    /// queue and taquba-mcp's audit/result/in-flight timestamps share one
+    /// view of "now."
+    ///
+    /// Production callers leave this unset (the default is
+    /// [`taquba::SystemClock`]). Tests can pass a [`taquba::MockClock`] to
+    /// advance time deterministically.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Open the Taquba queue and finalize the backend.
     pub async fn build(self) -> Result<Arc<TaqubaTaskBackend>> {
         let object_store = self
@@ -661,19 +686,22 @@ impl TaqubaTaskBackendBuilder {
             .prefix
             .ok_or_else(|| Error::Configuration("prefix is required".into()))?;
 
+        let clock: Arc<dyn Clock> = self.clock.unwrap_or_else(|| Arc::new(SystemClock));
+
         let queue_path = format!("{}/queue", prefix_str.trim_end_matches('/'));
         let queue = Queue::open_with_options(
             object_store.clone(),
             &queue_path,
             OpenOptions {
                 default_queue_config: self.config.default_retry_policy.to_queue_config(),
+                clock: clock.clone(),
                 ..OpenOptions::default()
             },
         )
         .await?;
         let prefix = Path::from(prefix_str);
-        let result_store = ResultStore::new(object_store.clone(), prefix.clone());
-        let audit_log = AuditLog::new(object_store, prefix);
+        let result_store = ResultStore::new(object_store.clone(), prefix.clone(), clock.clone());
+        let audit_log = AuditLog::new(object_store, prefix, clock.clone());
 
         Ok(Arc::new(TaqubaTaskBackend {
             queue: Arc::new(queue),
@@ -681,6 +709,7 @@ impl TaqubaTaskBackendBuilder {
             audit_log,
             in_flight: RwLock::new(InFlight::default()),
             config: self.config,
+            clock,
         }))
     }
 }

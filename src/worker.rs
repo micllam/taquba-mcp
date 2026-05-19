@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::backend::TaqubaTaskBackend;
 use crate::error::{Error, Result};
-use crate::result_store::{FinishedStatus, ResultRecord, ResultStore, expires_at_ms, now_ms};
+use crate::result_store::{FinishedStatus, ResultRecord, ResultStore, expires_at_ms};
 
 /// Retry policy applied to durable tool invocations.
 ///
@@ -277,7 +277,7 @@ async fn process_job<H>(
             event: AuditEvent::Started,
             task_id: task_id.clone(),
             tool: tool_name.clone(),
-            at_ms: now_ms(),
+            at_ms: backend.now_ms(),
             error: None,
         })
         .await;
@@ -298,14 +298,15 @@ async fn process_job<H>(
 
     match outcome {
         Ok(call_result) => {
+            let now = backend.now_ms();
             let record = ResultRecord {
                 task_id: task_id.clone(),
                 tool: tool_name.clone(),
                 status: FinishedStatus::Completed,
                 result: Some(call_result),
                 error: None,
-                completed_at_ms: now_ms(),
-                expires_at_ms: expires_at_ms(now_ms(), backend.config().result_retention),
+                completed_at_ms: now,
+                expires_at_ms: expires_at_ms(now, backend.config().result_retention),
             };
             if let Err(e) = result_store.put(&record).await {
                 tracing::error!(task_id = %task_id, error = %e, "result blob write failed");
@@ -315,7 +316,7 @@ async fn process_job<H>(
                     event: AuditEvent::Completed,
                     task_id: task_id.clone(),
                     tool: tool_name.clone(),
-                    at_ms: now_ms(),
+                    at_ms: now,
                     error: None,
                 })
                 .await;
@@ -357,7 +358,7 @@ async fn process_job<H>(
                             event: AuditEvent::Failed,
                             task_id: task_id.clone(),
                             tool: tool_name.clone(),
-                            at_ms: now_ms(),
+                            at_ms: backend.now_ms(),
                             error: Some(error_message.clone()),
                         })
                         .await;
@@ -378,14 +379,15 @@ async fn write_failed(
     tool: &str,
     error_message: String,
 ) {
+    let now = backend.now_ms();
     let record = ResultRecord {
         task_id: task_id.to_string(),
         tool: tool.to_string(),
         status: FinishedStatus::Failed,
         result: None,
         error: Some(error_message.clone()),
-        completed_at_ms: now_ms(),
-        expires_at_ms: expires_at_ms(now_ms(), backend.config().result_retention),
+        completed_at_ms: now,
+        expires_at_ms: expires_at_ms(now, backend.config().result_retention),
     };
     if let Err(e) = result_store.put(&record).await {
         tracing::error!(task_id = %task_id, error = %e, "failed result blob write failed");
@@ -395,7 +397,7 @@ async fn write_failed(
             event: AuditEvent::Failed,
             task_id: task_id.to_string(),
             tool: tool.to_string(),
-            at_ms: now_ms(),
+            at_ms: now,
             error: Some(error_message),
         })
         .await;
@@ -411,14 +413,15 @@ async fn write_cancelled(
     task_id: &str,
     tool: &str,
 ) {
+    let now = backend.now_ms();
     let record = ResultRecord {
         task_id: task_id.to_string(),
         tool: tool.to_string(),
         status: FinishedStatus::Cancelled,
         result: None,
         error: None,
-        completed_at_ms: now_ms(),
-        expires_at_ms: expires_at_ms(now_ms(), backend.config().result_retention),
+        completed_at_ms: now,
+        expires_at_ms: expires_at_ms(now, backend.config().result_retention),
     };
     if let Err(e) = result_store.put(&record).await {
         tracing::error!(task_id = %task_id, error = %e, "cancelled result blob write failed");
@@ -428,7 +431,7 @@ async fn write_cancelled(
             event: AuditEvent::Cancelled,
             task_id: task_id.to_string(),
             tool: tool.to_string(),
-            at_ms: now_ms(),
+            at_ms: now,
             error: None,
         })
         .await;

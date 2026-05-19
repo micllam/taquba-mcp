@@ -10,12 +10,13 @@
 //! entries whose `expires_at_ms` is in the past.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use rmcp::model::CallToolResult;
 use serde::{Deserialize, Serialize};
+use taquba::Clock;
 use taquba::object_store::{ObjectStore, PutPayload, path::Path};
 
 use crate::error::Result;
@@ -51,11 +52,16 @@ pub(crate) struct ResultRecord {
 pub(crate) struct ResultStore {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
+    clock: Arc<dyn Clock>,
 }
 
 impl ResultStore {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: Path) -> Self {
-        Self { store, prefix }
+    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: Path, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            store,
+            prefix,
+            clock,
+        }
     }
 
     fn key(&self, task_id: &str) -> Path {
@@ -120,7 +126,7 @@ impl ResultStore {
     /// Delete every record whose `expires_at_ms` is in the past. Called by
     /// the periodic reaper task.
     pub(crate) async fn reap(&self) -> Result<usize> {
-        let now_ms = now_ms();
+        let now_ms = self.clock.now_ms();
         let mut deleted = 0usize;
         for record in self.list().await? {
             if record.expires_at_ms <= now_ms {
@@ -133,13 +139,6 @@ impl ResultStore {
         }
         Ok(deleted)
     }
-}
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub(crate) fn expires_at_ms(now_ms: u64, retention: Duration) -> u64 {

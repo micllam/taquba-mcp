@@ -17,11 +17,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use taquba::Clock;
 use taquba::object_store::{ObjectStore, PutPayload, path::Path};
 use ulid::Ulid;
 
 use crate::error::Result;
-use crate::result_store::now_ms;
 
 /// Lifecycle event recorded into the audit log.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,11 +50,16 @@ pub(crate) struct AuditEntry {
 pub(crate) struct AuditLog {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
+    clock: Arc<dyn Clock>,
 }
 
 impl AuditLog {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: Path) -> Self {
-        Self { store, prefix }
+    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: Path, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            store,
+            prefix,
+            clock,
+        }
     }
 
     fn key(&self, ulid: &Ulid) -> Path {
@@ -75,7 +80,10 @@ impl AuditLog {
 
     /// Delete every audit entry whose ULID timestamp is older than `retention`.
     pub(crate) async fn reap(&self, retention: Duration) -> Result<usize> {
-        let cutoff_ms = now_ms().saturating_sub(retention.as_millis() as u64);
+        let cutoff_ms = self
+            .clock
+            .now_ms()
+            .saturating_sub(retention.as_millis() as u64);
         let prefix = self.prefix.child("audit");
         let mut stream = self.store.list(Some(&prefix));
         let mut deleted = 0usize;

@@ -94,6 +94,13 @@ pub use error::{Error, Result};
 pub use transport::{serve_stdio, serve_streamable_http};
 pub use worker::RetryPolicy;
 
+/// Re-exports of [`taquba`]'s time-source types. The backend's
+/// [`TaqubaTaskBackendBuilder::clock`](crate::TaqubaTaskBackendBuilder::clock)
+/// accepts any [`Clock`]; tests can pass a [`MockClock`] to advance time
+/// deterministically, while production callers leave the default
+/// [`SystemClock`].
+pub use taquba::{Clock, MockClock, SystemClock};
+
 /// Re-export of [`taquba`] so consumers can depend on a single version.
 pub use taquba;
 
