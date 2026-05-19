@@ -22,7 +22,7 @@ use taquba::object_store::memory::InMemory;
 use tokio_util::sync::CancellationToken;
 
 use crate::worker::run_workers;
-use crate::{TaqubaTaskBackend, taquba_task_handler};
+use crate::{Clock, MockClock, TaqubaTaskBackend, taquba_task_handler};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DoubleArgs {
@@ -116,15 +116,26 @@ struct Harness {
 impl Harness {
     /// Build a harness with the worker pool running.
     async fn with_workers() -> Self {
-        Self::build(true).await
+        Self::build(true, None, false).await
     }
 
     /// Build a harness with no worker pool; enqueued jobs stay `Pending`.
     async fn without_workers() -> Self {
-        Self::build(false).await
+        Self::build(false, None, false).await
     }
 
-    async fn build(start_workers: bool) -> Self {
+    /// Build a harness with workers running, virtualised time via the
+    /// supplied [`MockClock`], and the in-process reaper disabled (so
+    /// retention tests can drive the sweep manually).
+    async fn with_mock_clock(clock: MockClock) -> Self {
+        Self::build(true, Some(Arc::new(clock)), true).await
+    }
+
+    async fn build(
+        start_workers: bool,
+        clock: Option<Arc<dyn Clock>>,
+        disable_reaper: bool,
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter(
@@ -133,12 +144,16 @@ impl Harness {
             )
             .try_init();
         let store = Arc::new(InMemory::new());
-        let backend = TaqubaTaskBackend::builder()
+        let mut builder = TaqubaTaskBackend::builder()
             .object_store(store)
-            .prefix("itest")
-            .build()
-            .await
-            .expect("backend builds");
+            .prefix("itest");
+        if let Some(clock) = clock {
+            builder = builder.clock(clock);
+        }
+        if disable_reaper {
+            builder = builder.disable_reaper();
+        }
+        let backend = builder.build().await.expect("backend builds");
         let server = TestServer::new(backend.clone());
         let service = serve_directly(
             server.clone(),
@@ -357,6 +372,60 @@ async fn cancellation_is_cooperative_stubborn_tool_still_completes() {
     assert!(
         rendered.contains("slept anyway"),
         "expected the completion value, got: {rendered}"
+    );
+
+    h.shutdown().await;
+}
+
+/// Retention sweep with virtualised time: after a task completes, advancing
+/// the `MockClock` past `result_retention` and calling the result-store
+/// reaper deletes the blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn result_blob_expires_and_reaper_sweeps_it() {
+    let clock = MockClock::new(1_700_000_000_000);
+    let h = Harness::with_mock_clock(clock.clone()).await;
+    let task_id = h.enqueue("double", serde_json::json!({ "n": 7 })).await;
+
+    // Let the worker complete the task. `double` is synchronous, so this
+    // returns as soon as the blob is written and the queue job is acked.
+    let _ = h.get_result(&task_id).await.expect("task completes");
+
+    // The result blob is present immediately after completion.
+    assert!(
+        h.backend
+            .result_store()
+            .get(&task_id)
+            .await
+            .expect("result store get succeeds")
+            .is_some(),
+        "result blob should be present immediately after completion",
+    );
+
+    // Advance virtual time past the default 24h retention window. The
+    // worker stamped `expires_at_ms` from the same `MockClock`, so the
+    // record is now eligible for sweep.
+    clock.advance(Duration::from_secs(25 * 60 * 60));
+
+    let deleted = h
+        .backend
+        .result_store()
+        .reap()
+        .await
+        .expect("reap succeeds");
+    assert!(
+        deleted >= 1,
+        "reap should delete at least one expired blob, got {deleted}",
+    );
+
+    // ...and the blob is gone.
+    assert!(
+        h.backend
+            .result_store()
+            .get(&task_id)
+            .await
+            .expect("result store get succeeds")
+            .is_none(),
+        "result blob should be gone after reap",
     );
 
     h.shutdown().await;
