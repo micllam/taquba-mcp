@@ -113,29 +113,40 @@ struct Harness {
     workers: Option<tokio::task::JoinHandle<crate::Result<()>>>,
 }
 
+/// Options for [`Harness::build`].
+#[derive(Default)]
+struct HarnessOpts {
+    start_workers: bool,
+    clock: Option<Arc<dyn Clock>>,
+    disable_reaper: bool,
+}
+
+impl HarnessOpts {
+    /// Start the worker pool. The default leaves enqueued jobs `Pending`.
+    fn with_workers(mut self) -> Self {
+        self.start_workers = true;
+        self
+    }
+
+    /// Override the time source. Threaded into both Taquba and taquba-mcp
+    /// so the queue and the audit/result/in-flight timestamps share one
+    /// view of "now."
+    fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Suppress the in-process reaper. Use when the test wants to drive
+    /// the sweep manually (e.g. retention tests pairing this with
+    /// [`with_clock`](Self::with_clock) + a [`MockClock`]).
+    fn disable_reaper(mut self) -> Self {
+        self.disable_reaper = true;
+        self
+    }
+}
+
 impl Harness {
-    /// Build a harness with the worker pool running.
-    async fn with_workers() -> Self {
-        Self::build(true, None, false).await
-    }
-
-    /// Build a harness with no worker pool; enqueued jobs stay `Pending`.
-    async fn without_workers() -> Self {
-        Self::build(false, None, false).await
-    }
-
-    /// Build a harness with workers running, virtualised time via the
-    /// supplied [`MockClock`], and the in-process reaper disabled (so
-    /// retention tests can drive the sweep manually).
-    async fn with_mock_clock(clock: MockClock) -> Self {
-        Self::build(true, Some(Arc::new(clock)), true).await
-    }
-
-    async fn build(
-        start_workers: bool,
-        clock: Option<Arc<dyn Clock>>,
-        disable_reaper: bool,
-    ) -> Self {
+    async fn build(opts: HarnessOpts) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter(
@@ -147,10 +158,10 @@ impl Harness {
         let mut builder = TaqubaTaskBackend::builder()
             .object_store(store)
             .prefix("itest");
-        if let Some(clock) = clock {
+        if let Some(clock) = opts.clock {
             builder = builder.clock(clock);
         }
-        if disable_reaper {
+        if opts.disable_reaper {
             builder = builder.disable_reaper();
         }
         let backend = builder.build().await.expect("backend builds");
@@ -162,7 +173,7 @@ impl Harness {
         );
         let peer = service.peer().clone();
         let shutdown = CancellationToken::new();
-        let workers = start_workers.then(|| {
+        let workers = opts.start_workers.then(|| {
             tokio::spawn(run_workers(
                 backend.clone(),
                 server,
@@ -274,7 +285,7 @@ impl Harness {
 /// the `wait_for_completion`-backed `get_task_result`.
 #[tokio::test(flavor = "multi_thread")]
 async fn task_runs_and_wait_for_completion_returns_the_result() {
-    let h = Harness::with_workers().await;
+    let h = Harness::build(HarnessOpts::default().with_workers()).await;
     let task_id = h.enqueue("double", serde_json::json!({ "n": 21 })).await;
 
     let payload = h
@@ -295,7 +306,7 @@ async fn task_runs_and_wait_for_completion_returns_the_result() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_pending_task_removes_it_and_records_cancelled() {
     // No worker pool, so the enqueued job stays `Pending`.
-    let h = Harness::without_workers().await;
+    let h = Harness::build(HarnessOpts::default()).await;
     let task_id = h.enqueue("double", serde_json::json!({ "n": 1 })).await;
 
     assert_eq!(
@@ -314,7 +325,7 @@ async fn cancel_pending_task_removes_it_and_records_cancelled() {
 /// outcome without retrying.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_claimed_task_is_cooperative_and_tool_short_circuits() {
-    let h = Harness::with_workers().await;
+    let h = Harness::build(HarnessOpts::default().with_workers()).await;
     // A long sleep so the worker is mid-execution when we cancel.
     let task_id = h
         .enqueue("cooperative_sleep", serde_json::json!({ "ms": 60_000 }))
@@ -347,7 +358,7 @@ async fn cancel_claimed_task_is_cooperative_and_tool_short_circuits() {
 /// returns, even though `cancel_task` reported `Cancelled`.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_is_cooperative_stubborn_tool_still_completes() {
-    let h = Harness::with_workers().await;
+    let h = Harness::build(HarnessOpts::default().with_workers()).await;
     // Long enough that the cancel reliably lands while the tool is still
     // running (the test asserts the cancel hits a `Claimed` job), but
     // short enough not to drag the suite.
@@ -383,7 +394,13 @@ async fn cancellation_is_cooperative_stubborn_tool_still_completes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn result_blob_expires_and_reaper_sweeps_it() {
     let clock = MockClock::new(1_700_000_000_000);
-    let h = Harness::with_mock_clock(clock.clone()).await;
+    let h = Harness::build(
+        HarnessOpts::default()
+            .with_workers()
+            .with_clock(Arc::new(clock.clone()))
+            .disable_reaper(),
+    )
+    .await;
     let task_id = h.enqueue("double", serde_json::json!({ "n": 7 })).await;
 
     // Let the worker complete the task. `double` is synchronous, so this
@@ -435,7 +452,7 @@ async fn result_blob_expires_and_reaper_sweeps_it() {
 /// `resource_not_found`.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_unknown_task_is_not_found() {
-    let h = Harness::without_workers().await;
+    let h = Harness::build(HarnessOpts::default()).await;
     let err = h
         .cancel("no-such-task")
         .await
