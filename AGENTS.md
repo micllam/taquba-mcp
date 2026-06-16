@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to agents when working with code in this repository.
 
 Layout: a single flat crate — `Cargo.toml` + `src/` + `examples/` at the repo root. No Cargo workspace; reintroduce one only if sibling crates are ever added.
 
