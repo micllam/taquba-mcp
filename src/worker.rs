@@ -12,13 +12,14 @@ use std::time::Duration;
 use rmcp::ServerHandler;
 use rmcp::model::{CallToolRequestParams, ListToolsResult, TaskSupport, Tool};
 use rmcp::service::{Peer, RequestContext, RoleServer};
-use taquba::{JobRecord, PRIORITY_NORMAL, Queue, QueueConfig};
+use taquba::{AckEffects, JobRecord, PRIORITY_NORMAL, Queue, QueueConfig};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::backend::TaqubaTaskBackend;
 use crate::error::{Error, Result};
+use crate::pointer::{TaskPointer, pointer_key};
 use crate::result_store::{FinishedStatus, ResultRecord, ResultStore, expires_at_ms};
 
 /// Retry policy applied to durable tool invocations.
@@ -320,7 +321,16 @@ async fn process_job<H>(
                     error: None,
                 })
                 .await;
-            if let Err(e) = queue.ack(&job).await {
+            // Settle the job and commit the terminal pointer in one
+            // transaction: the result blob above is provisional until this
+            // ack commits, and the pointer is what readers consult.
+            let effects = pointer_effects(
+                &task_id,
+                FinishedStatus::Completed,
+                now,
+                record.expires_at_ms,
+            );
+            if let Err(e) = queue.ack_with(&job, effects).await {
                 tracing::error!(task_id = %task_id, error = %e, "ack failed");
             }
         }
@@ -331,9 +341,13 @@ async fn process_job<H>(
                 // returned an error; treat it as a terminal Cancelled
                 // outcome, not a retryable failure. `ack` the job: it is
                 // "handled", we just won't retry it. The Cancelled result
-                // blob is the queryable record of the outcome.
-                write_cancelled(result_store, audit_log, backend, &task_id, &tool_name).await;
-                if let Err(ae) = queue.ack(&job).await {
+                // blob is the queryable record of the outcome, and the
+                // pointer is committed atomically with the ack below.
+                let now = backend.now_ms();
+                let expires = expires_at_ms(now, backend.config().result_retention);
+                write_cancelled(result_store, audit_log, &task_id, &tool_name, now, expires).await;
+                let effects = pointer_effects(&task_id, FinishedStatus::Cancelled, now, expires);
+                if let Err(ae) = queue.ack_with(&job, effects).await {
                     tracing::error!(task_id = %task_id, error = %ae, "ack (cancelled) failed");
                 }
             } else {
@@ -403,17 +417,45 @@ async fn write_failed(
         .await;
 }
 
+/// Build the [`AckEffects`] for an ack-path terminal: a single KV write of the
+/// task's terminal [`TaskPointer`], committed atomically with the ack. A
+/// serialization failure (not expected for this tiny record) degrades to an
+/// empty-effects ack rather than leaving the job unsettled.
+fn pointer_effects(
+    task_id: &str,
+    status: FinishedStatus,
+    completed_at_ms: u64,
+    expires_at_ms: u64,
+) -> AckEffects {
+    let mut effects = AckEffects::default();
+    let pointer = TaskPointer {
+        status,
+        completed_at_ms,
+        expires_at_ms,
+    };
+    match pointer.to_bytes() {
+        Ok(bytes) => {
+            effects.kv_writes.insert(pointer_key(task_id), bytes);
+        }
+        Err(e) => {
+            tracing::error!(task_id = %task_id, error = %e, "terminal pointer serialize failed")
+        }
+    }
+    effects
+}
+
 /// Write a terminal `Cancelled` result blob and audit entry for a task whose
 /// tool short-circuited (returned an error) after its cooperative
-/// cancellation token fired.
+/// cancellation token fired. `now` / `expires_at_ms` are passed in so the
+/// blob and the pointer committed alongside the ack share one timestamp.
 async fn write_cancelled(
     result_store: &ResultStore,
     audit_log: &AuditLog,
-    backend: &Arc<TaqubaTaskBackend>,
     task_id: &str,
     tool: &str,
+    now: u64,
+    expires_at_ms: u64,
 ) {
-    let now = backend.now_ms();
     let record = ResultRecord {
         task_id: task_id.to_string(),
         tool: tool.to_string(),
@@ -421,7 +463,7 @@ async fn write_cancelled(
         result: None,
         error: None,
         completed_at_ms: now,
-        expires_at_ms: expires_at_ms(now, backend.config().result_retention),
+        expires_at_ms,
     };
     if let Err(e) = result_store.put(&record).await {
         tracing::error!(task_id = %task_id, error = %e, "cancelled result blob write failed");
@@ -448,8 +490,21 @@ async fn run_reaper(backend: Arc<TaqubaTaskBackend>, shutdown: CancellationToken
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
         }
-        if let Err(e) = result_store.reap().await {
-            tracing::warn!(error = %e, "result store reap failed");
+        match result_store.reap().await {
+            Ok(reaped) => {
+                // Drop the terminal pointer for each swept task so it never
+                // outlives its result blob (a dangling pointer would make
+                // get_task_info report Completed for a task whose result is
+                // already gone). kv_delete is idempotent, so tasks that never
+                // had a pointer (dead-lettered failures, Pending
+                // cancellations) are harmless no-ops.
+                for task_id in &reaped {
+                    if let Err(e) = backend.queue().kv_delete(&pointer_key(task_id)).await {
+                        tracing::warn!(task_id = %task_id, error = %e, "pointer reap failed");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "result store reap failed"),
         }
         if let Err(e) = audit_log.reap(audit_retention).await {
             tracing::warn!(error = %e, "audit log reap failed");

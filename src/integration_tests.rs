@@ -221,28 +221,22 @@ impl Harness {
             .task
     }
 
-    /// Poll `get_task_info` until the task is being actively run by a
-    /// worker (`snapshot_task` reports `status_message = "running"`).
+    /// Poll the queue until a worker has actually *claimed* the job (its lease
+    /// is held and the tool is running). Checking the queue job status,
+    /// rather than `get_task_info`'s `status_message`, avoids a race: the
+    /// in-flight marker is set at enqueue time, so `get_task_info` reports
+    /// "running" before any worker has claimed, which would let a subsequent
+    /// `cancel` land on a still-`Pending` job.
     async fn wait_until_running(&self, task_id: &str) {
         for _ in 0..400 {
-            if let Ok(info) = self
-                .backend
-                .get_task_info(
-                    GetTaskInfoParams {
-                        meta: None,
-                        task_id: task_id.to_string(),
-                    },
-                    self.ctx("poll"),
-                )
-                .await
-            {
-                if info.task.status_message.as_deref() == Some("running") {
+            if let Ok(Some(job)) = self.backend.queue().get_job(task_id).await {
+                if matches!(job.status, taquba::JobStatus::Claimed) {
                     return;
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("task {task_id} never reached the running state");
+        panic!("task {task_id} never reached the claimed state");
     }
 
     async fn get_result(
@@ -297,6 +291,51 @@ async fn task_runs_and_wait_for_completion_returns_the_result() {
         rendered.contains("42"),
         "expected the doubled value in the payload, got: {rendered}"
     );
+
+    h.shutdown().await;
+}
+
+/// A successful task settles through `Queue::ack_with`: the terminal pointer
+/// is committed to Taquba KV in the same transaction as the ack, and
+/// `get_task_info` then reports `Completed` by reading that pointer (not the
+/// provisional result blob).
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_task_settles_through_a_terminal_pointer() {
+    // Reaper off: this test reads back the pointer written by `ack_with`, so
+    // we don't want the reaper reclaiming an expired lease and forcing a
+    // `ClaimLost` requeue that races the assertion under load. The settlement
+    // path itself is unchanged.
+    let h = Harness::build(HarnessOpts::default().with_workers().disable_reaper()).await;
+    let task_id = h.enqueue("double", serde_json::json!({ "n": 9 })).await;
+    let _ = h.get_result(&task_id).await.expect("task completes");
+
+    // The worker acked via `ack_with`, committing the terminal pointer in the
+    // same transaction. `get_task_result` can return the instant the result
+    // blob is readable, slightly before that commit is visible to this separate
+    // reader, so poll over a short bounded window.
+    let mut pointer = None;
+    for _ in 0..100 {
+        if let Some(p) = crate::pointer::read(h.backend.queue(), &task_id)
+            .await
+            .expect("pointer read succeeds")
+        {
+            pointer = Some(p);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pointer = pointer.expect("a completed task has a terminal pointer");
+    assert!(
+        matches!(
+            pointer.status,
+            crate::result_store::FinishedStatus::Completed
+        ),
+        "expected a Completed pointer, got {:?}",
+        pointer.status,
+    );
+
+    // ...and get_task_info surfaces it.
+    assert_eq!(h.task_status(&task_id).await.status, TaskStatus::Completed);
 
     h.shutdown().await;
 }
@@ -423,15 +462,15 @@ async fn result_blob_expires_and_reaper_sweeps_it() {
     // record is now eligible for sweep.
     clock.advance(Duration::from_secs(25 * 60 * 60));
 
-    let deleted = h
+    let reaped = h
         .backend
         .result_store()
         .reap()
         .await
         .expect("reap succeeds");
     assert!(
-        deleted >= 1,
-        "reap should delete at least one expired blob, got {deleted}",
+        reaped.iter().any(|id| id == &task_id),
+        "reap should sweep the expired task, got {reaped:?}",
     );
 
     // ...and the blob is gone.

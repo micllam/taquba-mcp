@@ -82,6 +82,7 @@ mod audit;
 mod backend;
 mod error;
 mod handler;
+mod pointer;
 mod result_store;
 mod transport;
 mod worker;

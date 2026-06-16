@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::error::{Error, Result};
+use crate::pointer;
 use crate::result_store::{FinishedStatus, ResultRecord, ResultStore, expires_at_ms};
 use crate::worker::{InFlight, InFlightInfo, RetryPolicy};
 
@@ -495,11 +496,29 @@ impl TaqubaTaskBackend {
     }
 
     async fn snapshot_task(&self, task_id: &str) -> std::result::Result<Option<Task>, McpError> {
-        // 1. In-flight (running) takes priority (most informative).
+        // 1. Terminal pointer, committed atomically with the worker's ack, is
+        // the authoritative record for ack-settled outcomes (Completed /
+        // cooperative Cancelled). It is checked *first* so it wins over a stale
+        // in-flight entry: `enqueue_task` records in-flight after the job is
+        // already claimable, so a fast worker can settle and clear before that
+        // record lands, leaving an entry that never clears. It also beats the
+        // result blob, which a worker writes *before* its ack, so a
+        // still-claimed (and potentially re-running) job is never reported
+        // terminal.
+        if let Some(p) = pointer::read(&self.queue, task_id)
+            .await
+            .map_err(|e| McpError::internal_error(format!("pointer read failed: {e}"), None))?
+        {
+            let ts = ms_to_rfc3339(p.completed_at_ms);
+            let mut task = Task::new(task_id.to_string(), p.status.into(), ts.clone(), ts);
+            if let Some(ttl) = self.task_ttl_ms() {
+                task = task.with_ttl(ttl);
+            }
+            return Ok(Some(task));
+        }
+        // 2. In-flight (a worker is actively running the tool).
         if let Some(info) = self.in_flight.read().await.get(task_id).cloned() {
-            let started = chrono::DateTime::<Utc>::from_timestamp_millis(info.started_at_ms as i64)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_else(|| Utc::now().to_rfc3339());
+            let started = ms_to_rfc3339(info.started_at_ms);
             let now = Utc::now().to_rfc3339();
             let mut task = Task::new(task_id.to_string(), TaskStatus::Working, started, now)
                 .with_status_message("running");
@@ -508,44 +527,51 @@ impl TaqubaTaskBackend {
             }
             return Ok(Some(task));
         }
-        // 2. Result store covers Completed/Failed/Cancelled.
-        if let Some(record) =
-            self.result_store.get(task_id).await.map_err(|e| {
-                McpError::internal_error(format!("result store read failed: {e}"), None)
-            })?
-        {
-            let ts = chrono::DateTime::<Utc>::from_timestamp_millis(record.completed_at_ms as i64)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_else(|| Utc::now().to_rfc3339());
-            let mut task = Task::new(task_id.to_string(), record.status.into(), ts.clone(), ts);
-            if let Some(ttl) = self.task_ttl_ms() {
-                task = task.with_ttl(ttl);
-            }
-            if let Some(err) = record.error {
-                task = task.with_status_message(err);
-            }
-            return Ok(Some(task));
-        }
-        // 3. Queue-resident (Pending/Scheduled): surfaces tasks the in-flight
-        // map missed (e.g. after a restart before any worker has claimed yet).
+        // 3. Live queue job: Claimed is still running (its result blob, if any,
+        // is provisional until the ack settles the pointer above); Pending /
+        // Scheduled is queued. Done and Dead fall through to the result blob
+        // for the terminal record (and, for failures, the error message).
         if let Some(job) = self
             .queue
             .get_job(task_id)
             .await
             .map_err(|e| McpError::internal_error(format!("queue lookup failed: {e}"), None))?
         {
-            let now = Utc::now().to_rfc3339();
-            let mut task = Task::new(
-                task_id.to_string(),
-                TaskStatus::Working,
-                chrono::DateTime::<Utc>::from_timestamp_millis(job.enqueued_at as i64)
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| now.clone()),
-                now,
-            )
-            .with_status_message("queued");
+            let message = match job.status {
+                JobStatus::Claimed => Some("running"),
+                JobStatus::Pending | JobStatus::Scheduled => Some("queued"),
+                JobStatus::Done | JobStatus::Dead => None,
+            };
+            if let Some(message) = message {
+                let now = Utc::now().to_rfc3339();
+                let mut task = Task::new(
+                    task_id.to_string(),
+                    TaskStatus::Working,
+                    ms_to_rfc3339(job.enqueued_at),
+                    now,
+                )
+                .with_status_message(message);
+                if let Some(ttl) = self.task_ttl_ms() {
+                    task = task.with_ttl(ttl);
+                }
+                return Ok(Some(task));
+            }
+        }
+        // 4. Result blob: terminal outcomes that carry no pointer
+        // (dead-lettered failures and tasks cancelled while still Pending),
+        // plus a defensive fallback for any terminal whose queue job is gone.
+        if let Some(record) =
+            self.result_store.get(task_id).await.map_err(|e| {
+                McpError::internal_error(format!("result store read failed: {e}"), None)
+            })?
+        {
+            let ts = ms_to_rfc3339(record.completed_at_ms);
+            let mut task = Task::new(task_id.to_string(), record.status.into(), ts.clone(), ts);
             if let Some(ttl) = self.task_ttl_ms() {
                 task = task.with_ttl(ttl);
+            }
+            if let Some(err) = record.error {
+                task = task.with_status_message(err);
             }
             return Ok(Some(task));
         }
@@ -556,6 +582,14 @@ impl TaqubaTaskBackend {
         let ms = self.config.result_retention.as_millis();
         u64::try_from(ms).ok()
     }
+}
+
+/// Render a millisecond UNIX timestamp as an RFC 3339 string, falling back to
+/// "now" if the value is somehow out of range.
+fn ms_to_rfc3339(ms: u64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp_millis(ms as i64)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| Utc::now().to_rfc3339())
 }
 
 impl From<FinishedStatus> for TaskStatus {

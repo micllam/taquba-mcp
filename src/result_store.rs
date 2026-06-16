@@ -124,16 +124,17 @@ impl ResultStore {
     }
 
     /// Delete every record whose `expires_at_ms` is in the past. Called by
-    /// the periodic reaper task.
-    pub(crate) async fn reap(&self) -> Result<usize> {
+    /// the periodic reaper task. Returns the task ids that were swept so the
+    /// caller can drop their terminal KV pointers in step.
+    pub(crate) async fn reap(&self) -> Result<Vec<String>> {
         let now_ms = self.clock.now_ms();
-        let mut deleted = 0usize;
+        let mut deleted = Vec::new();
         for record in self.list().await? {
             if record.expires_at_ms <= now_ms {
                 if let Err(e) = self.delete(&record.task_id).await {
                     tracing::warn!(task_id = %record.task_id, error = %e, "reap failed");
                 } else {
-                    deleted += 1;
+                    deleted.push(record.task_id);
                 }
             }
         }
