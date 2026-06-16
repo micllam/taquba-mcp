@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `TaqubaTaskBackendBuilder::clock` and re-exports of taquba's `Clock`,
+  `MockClock`, and `SystemClock`. Callers can inject a time source that drives
+  every state-transition timestamp, so tests can advance time deterministically
+  with a `MockClock`.
+
 ### Changed
 
+- Bumped `taquba` to 0.8. Pre-1.0: the on-store queue layout may differ from the
+  0.4-based 0.1.0 release; drain in-flight tasks before upgrading.
 - Successful and cancelled tasks now settle through `taquba::Queue::ack_with`,
   committing a terminal status pointer to taquba's KV namespace in the same
   transaction as the job ack. Adds one small KV entry per ack-settled task.
