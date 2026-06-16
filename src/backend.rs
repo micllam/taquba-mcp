@@ -21,6 +21,7 @@ use taquba::object_store::ObjectStore;
 use taquba::object_store::path::Path;
 use taquba::{CancelOutcome, Clock, EnqueueOptions, JobStatus, OpenOptions, Queue, SystemClock};
 use tokio::sync::RwLock;
+use ulid::Ulid;
 
 use crate::audit::{AuditEntry, AuditEvent, AuditLog};
 use crate::error::{Error, Result};
@@ -154,18 +155,13 @@ impl TaqubaTaskBackend {
         let mut headers = HashMap::new();
         headers.insert("tool".to_string(), tool.clone());
 
-        let opts = EnqueueOptions {
-            headers,
-            ..EnqueueOptions::default()
-        };
-        let task_id = self
-            .queue
-            .enqueue_with(&tool, payload, opts)
-            .await
-            .map_err(|e| McpError::internal_error(format!("taquba enqueue failed: {e}"), None))?;
-
-        // Track it as in-flight so `list_tasks` / `get_task_info` see it
-        // before a worker has claimed.
+        // Pre-assign the task id (via `id_override`) so we can record it
+        // in-flight *before* the job becomes claimable. Recording after the
+        // enqueue would race a fast worker that claims, runs, and clears the
+        // entry before the insert ran, leaving a "running" entry that never
+        // clears. A ULID matches taquba's own id scheme and preserves
+        // FIFO-within-priority claim order.
+        let task_id = Ulid::new().to_string();
         let now = self.now_ms();
         self.in_flight.write().await.insert(
             task_id.clone(),
@@ -174,6 +170,21 @@ impl TaqubaTaskBackend {
                 started_at_ms: now,
             },
         );
+
+        let opts = EnqueueOptions {
+            headers,
+            id_override: Some(task_id.clone()),
+            ..EnqueueOptions::default()
+        };
+        if let Err(e) = self.queue.enqueue_with(&tool, payload, opts).await {
+            // The job never landed; drop the in-flight entry we optimistically
+            // wrote so it does not leak as a phantom task.
+            self.in_flight.write().await.remove(&task_id);
+            return Err(McpError::internal_error(
+                format!("taquba enqueue failed: {e}"),
+                None,
+            ));
+        }
 
         let _ = self
             .audit_log
@@ -498,11 +509,8 @@ impl TaqubaTaskBackend {
     async fn snapshot_task(&self, task_id: &str) -> std::result::Result<Option<Task>, McpError> {
         // 1. Terminal pointer, committed atomically with the worker's ack, is
         // the authoritative record for ack-settled outcomes (Completed /
-        // cooperative Cancelled). It is checked *first* so it wins over a stale
-        // in-flight entry: `enqueue_task` records in-flight after the job is
-        // already claimable, so a fast worker can settle and clear before that
-        // record lands, leaving an entry that never clears. It also beats the
-        // result blob, which a worker writes *before* its ack, so a
+        // cooperative Cancelled). It is checked *first* so it takes precedence
+        // over the result blob, which a worker writes *before* its ack: a
         // still-claimed (and potentially re-running) job is never reported
         // terminal.
         if let Some(p) = pointer::read(&self.queue, task_id)

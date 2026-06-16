@@ -340,6 +340,29 @@ async fn successful_task_settles_through_a_terminal_pointer() {
     h.shutdown().await;
 }
 
+/// A completed task appears in `list_tasks` exactly once, as the terminal
+/// outcome. `enqueue_task` records the in-flight entry under a pre-assigned id
+/// before the job is claimable, so a fast worker cannot leave a stale "running"
+/// entry that would double-list the task alongside its result blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_task_lists_once_as_terminal() {
+    let h = Harness::build(HarnessOpts::default().with_workers().disable_reaper()).await;
+    let task_id = h.enqueue("double", serde_json::json!({ "n": 4 })).await;
+    let _ = h.get_result(&task_id).await.expect("task completes");
+
+    let tasks = h
+        .backend
+        .list_tasks(None, h.ctx("list"))
+        .await
+        .expect("list_tasks succeeds")
+        .tasks;
+    let mine: Vec<_> = tasks.iter().filter(|t| t.task_id == task_id).collect();
+    assert_eq!(mine.len(), 1, "expected exactly one entry, got {mine:?}");
+    assert_eq!(mine[0].status, TaskStatus::Completed);
+
+    h.shutdown().await;
+}
+
 /// `cancel_task` on a still-`Pending` job: `CancelOutcome::Removed`; the
 /// queue job is removed and a terminal `Cancelled` blob is recorded.
 #[tokio::test(flavor = "multi_thread")]

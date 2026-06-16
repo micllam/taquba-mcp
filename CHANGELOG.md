@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job is still claimed and could re-run: terminal reads consult the atomically
   committed pointer rather than the provisional result blob, and a stale
   in-flight entry can no longer mask a settled task.
+- `list_tasks` no longer shows a phantom "running" duplicate for a completed
+  task. `enqueue_task` now assigns the task id (via taquba's `id_override`) and
+  records the in-flight entry before the job is claimable, closing a race where
+  a fast worker could settle and clear the entry before it was written.
 
 ## [0.1.0] - 2026-05-14
 
